@@ -1680,3 +1680,210 @@ fn a_new_proposal_restarts_the_clock() {
         Err(Ok(LedgerError::UpgradeDelayNotElapsed.into()))
     );
 }
+
+// ---- get_all_reports (#104) -----------------------------------------------
+
+#[test]
+fn get_all_reports_is_empty_when_nothing_is_posted() {
+    let f = listed();
+    assert_eq!(f.ledger.get_all_reports(&f.sac).len(), 0);
+}
+
+#[test]
+fn get_all_reports_returns_live_reports_sorted_by_tier_desc() {
+    let f = listed();
+    let auditor2 = add_reporter(&f, Role::Auditor);
+    post(&f, &f.transcriber, UNIT, T0 - 30);
+    post(&f, &f.issuer, 2 * UNIT, T0 - 20);
+    post(&f, &f.auditor, 3 * UNIT, T0 - 10);
+    post(&f, &auditor2, 4 * UNIT, T0);
+
+    let reports = f.ledger.get_all_reports(&f.sac);
+    assert_eq!(reports.len(), 4);
+    assert_eq!(reports.get(0).unwrap().tier, Tier::AuditorSigned);
+    assert_eq!(reports.get(1).unwrap().tier, Tier::AuditorSigned);
+    assert_eq!(reports.get(2).unwrap().tier, Tier::IssuerSigned);
+    assert_eq!(reports.get(3).unwrap().tier, Tier::Transcribed);
+}
+
+#[test]
+fn get_all_reports_excludes_expired_and_revoked_reports() {
+    let f = listed();
+    post(&f, &f.transcriber, UNIT, T0 - 100);
+    post(&f, &f.auditor, 2 * UNIT, T0 - 100);
+    post(&f, &f.issuer, 3 * UNIT, T0);
+
+    // Revoke the auditor: its report stops counting immediately.
+    f.registry.revoke(&f.auditor);
+    // Advance past MAX_REPORT_AGE_SECS for the transcriber's report, while
+    // keeping the issuer's report within the live window.
+    f.env
+        .ledger()
+        .set_timestamp(T0 - 100 + MAX_REPORT_AGE_SECS + 1);
+
+    let reports = f.ledger.get_all_reports(&f.sac);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports.get(0).unwrap().tier, Tier::IssuerSigned);
+    assert_eq!(reports.get(0).unwrap().reporter, f.issuer);
+}
+
+#[test]
+fn get_all_reports_caps_at_safe_limit() {
+    let f = listed();
+    let total = MAX_ALL_REPORTS + 2;
+    let mut reporters_vec = Vec::new(&f.env);
+    f.env.as_contract(&f.ledger.address, || {
+        for i in 0..total {
+            let reporter = Address::generate(&f.env);
+            let report = ReserveReport {
+                amount: UNIT + i as i128,
+                as_of: T0,
+                posted_at: T0,
+                tier: Tier::IssuerSigned,
+                reporter: reporter.clone(),
+                doc_hash: hash(&f.env, 7),
+                doc_uri: uri(&f.env),
+            };
+            f.env.storage().persistent().set(
+                &DataKey::ReportBy(f.sac.clone(), Tier::IssuerSigned, reporter.clone()),
+                &report,
+            );
+            reporters_vec.push_back(reporter);
+        }
+        f.env.storage().persistent().set(
+            &DataKey::Reporters(f.sac.clone(), Tier::IssuerSigned),
+            &reporters_vec,
+        );
+    });
+
+    let reports = f.ledger.get_all_reports(&f.sac);
+    assert_eq!(reports.len(), MAX_ALL_REPORTS);
+}
+
+// ---- resource budget regression tests (#103) ------------------------------
+
+/// Budget ceilings for `is_covered`, `post_supply`, and `post_reserve`
+/// (`post_report`), mirroring `resource-budgets.json` (measured via
+/// `env.cost_estimate()`, Soroban's in-process `simulateTransaction`
+/// metering). Raise a ceiling deliberately when a change requires more headroom.
+const IS_COVERED_MAX_CPU_INSTRUCTIONS: u64 = 155_000;
+const IS_COVERED_MAX_MEMORY_BYTES: u64 = 84_000;
+const POST_SUPPLY_MAX_CPU_INSTRUCTIONS: u64 = 230_000;
+const POST_SUPPLY_MAX_MEMORY_BYTES: u64 = 116_000;
+const POST_RESERVE_MAX_CPU_INSTRUCTIONS: u64 = 285_000;
+const POST_RESERVE_MAX_MEMORY_BYTES: u64 = 147_000;
+
+const RESOURCE_BUDGETS: &str = include_str!("../../../resource-budgets.json");
+
+fn json_ceiling(function: &str) -> (u64, u64) {
+    let budgets: serde_json::Value =
+        serde_json::from_str(RESOURCE_BUDGETS).expect("resource-budgets.json is valid JSON");
+    let entry = &budgets["functions"][function];
+    (
+        entry["cpu_instructions"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{function} has no cpu_instructions ceiling")),
+        entry["memory_bytes"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{function} has no memory_bytes ceiling")),
+    )
+}
+
+fn assert_within_budget(
+    f: &Fixture,
+    function: &str,
+    const_cpu: u64,
+    const_memory: u64,
+    call: impl FnOnce(),
+) {
+    let (json_cpu, json_memory) = json_ceiling(function);
+    assert_eq!(const_cpu, json_cpu, "{function} CPU ceiling constant out of sync");
+    assert_eq!(const_memory, json_memory, "{function} memory ceiling constant out of sync");
+
+    // `env.cost_estimate().budget()` models `simulateTransaction` instruction
+    // and memory metering for the invocation.
+    f.env.cost_estimate().budget().reset_default();
+    call();
+    let measured = f.env.cost_estimate().budget();
+    let cpu = measured.cpu_instruction_cost();
+    let memory = measured.memory_bytes_cost();
+    std::println!(
+        "{function}: {cpu} CPU instructions, {memory} memory bytes (ceilings {const_cpu}, {const_memory})"
+    );
+    assert!(
+        cpu <= const_cpu,
+        "{function} used {cpu} CPU instructions, over its {const_cpu} ceiling by {}. \
+         Make it cheaper, or raise the ceiling in test.rs and resource-budgets.json.",
+        cpu - const_cpu
+    );
+    assert!(
+        memory <= const_memory,
+        "{function} used {memory} memory bytes, over its {const_memory} ceiling by {}. \
+         Make it cheaper, or raise the ceiling in test.rs and resource-budgets.json.",
+        memory - const_memory
+    );
+}
+
+#[test]
+fn is_covered_stays_within_its_resource_budget() {
+    let f = listed();
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    f.ledger.post_reserve(
+        &f.issuer,
+        &f.sac,
+        &(100 * UNIT),
+        &T0,
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+    assert_within_budget(
+        &f,
+        "is_covered",
+        IS_COVERED_MAX_CPU_INSTRUCTIONS,
+        IS_COVERED_MAX_MEMORY_BYTES,
+        || {
+            assert!(f
+                .ledger
+                .is_covered(&f.sac, &10_000, &86_400, &Tier::Transcribed));
+        },
+    );
+}
+
+#[test]
+fn post_supply_stays_within_its_resource_budget() {
+    let f = listed();
+    assert_within_budget(
+        &f,
+        "post_supply",
+        POST_SUPPLY_MAX_CPU_INSTRUCTIONS,
+        POST_SUPPLY_MAX_MEMORY_BYTES,
+        || {
+            f.ledger
+                .post_supply(&f.poster, &f.sac, &UNIT, &990, &hash(&f.env, 1));
+        },
+    );
+}
+
+#[test]
+fn post_report_stays_within_its_resource_budget() {
+    let f = listed();
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    assert_within_budget(
+        &f,
+        "post_reserve",
+        POST_RESERVE_MAX_CPU_INSTRUCTIONS,
+        POST_RESERVE_MAX_MEMORY_BYTES,
+        || {
+            f.ledger.post_reserve(
+                &f.auditor,
+                &f.sac,
+                &(100 * UNIT),
+                &T0,
+                &hash(&f.env, 2),
+                &uri(&f.env),
+            );
+        },
+    );
+}

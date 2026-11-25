@@ -182,8 +182,12 @@ stellar contract invoke --network testnet --send=no \
 ### Verifying a deployed contract against a release
 
 Every `v*` tag publishes a GitHub release containing the three wasm files,
-their interface specs (`*.spec.json`) and `SHA256SUMS`. Download a release and
-check it before comparing it with what is deployed:
+their interface specs (`*.spec.json`) and `SHA256SUMS`. On every `v*` tag, the
+[Release](.github/workflows/release.yml) workflow also rebuilds the contracts
+from source and verifies that each wasm SHA-256 hash matches the hash
+published under `liveWasm` in [deployments/testnet.json](deployments/testnet.json).
+
+Download a release and check it before comparing it with what is deployed:
 
 ```bash
 gh release download v0.1.0 --pattern '*'
@@ -191,6 +195,15 @@ sha256sum -c SHA256SUMS
 
 stellar contract info hash --wasm coverage_ledger.wasm
 stellar contract info hash --id CC2QQ7R4FLPHZP7KA5AO4IASXXICTG6N4GQXCXITTEBNYQEYTYXKMN4D --network testnet
+```
+
+To verify the reproducible wasm build locally from source against
+[deployments/testnet.json](deployments/testnet.json):
+
+```bash
+stellar contract build --locked
+sha256sum target/wasm32v1-none/release/coverage_ledger.wasm
+jq -r '.liveWasm.coverageLedger' deployments/testnet.json
 ```
 
 The two hashes must match. `deployments/testnet.json` records the wasm hash

@@ -267,6 +267,7 @@ data layouts, with real testnet examples, are in [EVENTS.md](EVENTS.md).
 | `get_supply(sac)` | — | `Option<SupplySnapshot>` | — | — |
 | `get_report(sac, tier: Tier)` | — | `Option<ReserveReport>` (the freshest report at that tier that counts) | — | — |
 | `get_reports(sac)` | — | `Vec<ReserveReport>` (every stored report that counts: strongest tier first, then first-post order within a tier) | — | — |
+| `get_all_reports(sac)` | — | `Vec<ReserveReport>` (every non-expired counting report within 90 days, sorted by tier descending, capped at 20) | — | — |
 | `coverage(sac, min_tier: Tier)` | — | `Option<Coverage>` | — | — |
 | `is_covered(sac, min_bps: u32, max_age: u64, min_tier: Tier)` | — | `bool` | — | — |
 | `registry()` / `admin()` | — | `Address` | — | — |

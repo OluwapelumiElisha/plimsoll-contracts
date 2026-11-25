@@ -23,6 +23,13 @@ const MAX_CODE_LEN: usize = 12;
 /// `coverage` reads, and so what every `is_covered` caller pays.
 pub const MAX_REPORTERS_PER_TIER: u32 = 4;
 
+/// Maximum number of live reports returned by [`CoverageLedger::get_all_reports`].
+pub const MAX_ALL_REPORTS: u32 = 20;
+
+/// Maximum report age in seconds (90 days, matching the persistent TTL window)
+/// for [`CoverageLedger::get_all_reports`] to treat a report as non-expired.
+pub const MAX_REPORT_AGE_SECS: u64 = 90 * 86_400;
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -533,6 +540,28 @@ impl CoverageLedger {
             for report in reports_at(&env, &sac, tier).iter() {
                 if counts(&registry, &report) {
                     out.push_back(report);
+                }
+            }
+        }
+        out
+    }
+
+    /// All live (non-expired and still counting) reports for `sac`, sorted by
+    /// tier descending (`AuditorSigned`, `IssuerSigned`, `Transcribed`), capped
+    /// at [`MAX_ALL_REPORTS`].
+    pub fn get_all_reports(env: Env, sac: Address) -> Vec<ReserveReport> {
+        let registry = RegistryClient::new(&env, &registry(&env));
+        let now = env.ledger().timestamp();
+        let mut out = Vec::new(&env);
+        for tier in Tier::ALL_DESC {
+            for report in reports_at(&env, &sac, tier).iter() {
+                if now.saturating_sub(report.as_of) <= MAX_REPORT_AGE_SECS
+                    && counts(&registry, &report)
+                {
+                    out.push_back(report);
+                    if out.len() >= MAX_ALL_REPORTS {
+                        return out;
+                    }
                 }
             }
         }
