@@ -2020,6 +2020,8 @@ fn assert_within_budget(
         "{function} used {memory} memory bytes, over its {const_memory} ceiling by {}. \
          Make it cheaper, or raise the ceiling in test.rs and resource-budgets.json.",
         memory - const_memory
+    );
+}
 
 // ---- emergency pause (#77) ------------------------------------------------
 
@@ -2065,7 +2067,10 @@ fn is_covered_stays_within_its_resource_budget() {
                 .ledger
                 .is_covered(&f.sac, &10_000, &86_400, &Tier::Transcribed));
         },
+    );
+}
 
+#[test]
 fn unpause_clears_the_flag_and_emits_the_admin() {
     let f = listed();
     f.ledger.pause();
@@ -2096,7 +2101,10 @@ fn post_supply_stays_within_its_resource_budget() {
             f.ledger
                 .post_supply(&f.poster, &f.sac, &UNIT, &990, &hash(&f.env, 1));
         },
+    );
+}
 
+#[test]
 fn pause_is_idempotent() {
     let f = listed();
     f.ledger.pause();
@@ -2400,7 +2408,10 @@ fn post_report_stays_within_its_resource_budget() {
                 &uri(&f.env),
             );
         },
+    );
+}
 
+#[test]
 fn enable_native_supply_requires_the_admin() {
     let f = listed();
     let stranger = Address::generate(&f.env);
