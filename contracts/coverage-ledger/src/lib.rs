@@ -23,6 +23,12 @@ const MAX_CODE_LEN: usize = 12;
 /// Most reporters whose figures one asset keeps at one tier. Bounds what
 /// `coverage` reads, and so what every `is_covered` caller pays.
 pub const MAX_REPORTERS_PER_TIER: u32 = 4;
+/// At Stellar's usual five-second ledger cadence, bounds supply snapshots to
+/// approximately one hour of age.
+pub const MAX_SUPPLY_LEDGER_AGE: u32 = 720;
+
+/// Most asset-reporter pairs one `asset_reporter_pairs` call returns.
+pub const MAX_PAIRS_PER_CALL: u32 = 50;
 
 /// Maximum number of live reports returned by [`CoverageLedger::get_all_reports`].
 pub const MAX_ALL_REPORTS: u32 = 20;
@@ -51,6 +57,8 @@ enum DataKey {
     NativeSupply(Address),
     /// Maps a deprecated asset SAC to its successor SAC (at most one hop).
     Alias(Address),
+    /// Index of all listed asset SACs, in listing order.
+    Assets,
 }
 
 #[contracterror]
@@ -74,6 +82,8 @@ pub enum LedgerError {
     UpgradeDelayNotElapsed = 15,
     SelfAlias = 16,
     Paused = 17,
+    LedgerTooOld = 18,
+    NoReportToRetract = 19,
 }
 
 #[contractevent]
@@ -108,6 +118,17 @@ pub struct ReservePosted {
     pub reporter: Address,
     pub doc_hash: BytesN<32>,
     pub doc_uri: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveRetracted {
+    #[topic]
+    pub sac: Address,
+    #[topic]
+    pub tier: Tier,
+    pub reporter: Address,
+    pub as_of: u64,
 }
 
 #[contractevent]
@@ -262,6 +283,10 @@ fn parse_sac_name(env: &Env, name: &String) -> Option<(String, Address)> {
 
 fn reporters(env: &Env, sac: &Address, tier: Tier) -> Vec<Address> {
     read_persistent(env, &DataKey::Reporters(sac.clone(), tier)).unwrap_or_else(|| Vec::new(env))
+}
+
+fn assets(env: &Env) -> Vec<Address> {
+    read_persistent(env, &DataKey::Assets).unwrap_or_else(|| Vec::new(env))
 }
 
 /// Every stored report at `tier`: a not-yet-migrated v0.1 entry first, then
@@ -486,6 +511,9 @@ impl CoverageLedger {
             listed_at: env.ledger().timestamp(),
         };
         write_persistent(&env, &key, &record);
+        let mut index = assets(&env);
+        index.push_back(sac.clone());
+        write_persistent(&env, &DataKey::Assets, &index);
         bump_instance(&env);
         AssetListed { sac, code, issuer }.publish(&env);
         record
@@ -510,8 +538,12 @@ impl CoverageLedger {
         if amount < 0 {
             panic_with_error!(&env, LedgerError::InvalidAmount);
         }
-        if ledger > env.ledger().sequence() {
+        let current_ledger = env.ledger().sequence();
+        if ledger > current_ledger {
             panic_with_error!(&env, LedgerError::FutureLedger);
+        }
+        if current_ledger - ledger > MAX_SUPPLY_LEDGER_AGE {
+            panic_with_error!(&env, LedgerError::LedgerTooOld);
         }
         let key = DataKey::Supply(sac.clone());
         if let Some(previous) = read_persistent::<SupplySnapshot>(&env, &key) {
@@ -635,6 +667,55 @@ impl CoverageLedger {
         }
         .publish(&env);
         tier
+    }
+
+    /// Remove the caller's latest reserve report at the tier their identity
+    /// resolves to, returning coverage to the next report if one exists.
+    pub fn retract_reserve(env: Env, reporter: Address, sac: Address) {
+        reporter.require_auth();
+        let asset = require_listed(&env, &sac);
+        let tier = if reporter == asset.issuer {
+            Tier::IssuerSigned
+        } else {
+            match RegistryClient::new(&env, &registry(&env)).role_of(&reporter) {
+                Some(Role::Auditor) => Tier::AuditorSigned,
+                Some(Role::Transcriber) => Tier::Transcribed,
+                _ => panic_with_error!(&env, LedgerError::NotReporter),
+            }
+        };
+
+        migrate_legacy(&env, &sac, tier);
+        let report_key = DataKey::ReportBy(sac.clone(), tier, reporter.clone());
+        let report = match read_persistent::<ReserveReport>(&env, &report_key) {
+            Some(report) if report.reporter == reporter => report,
+            _ => panic_with_error!(&env, LedgerError::NoReportToRetract),
+        };
+        let mut index = reporters(&env, &sac, tier);
+        if let Some(i) = index
+            .iter()
+            .position(|indexed| indexed == reporter)
+            .and_then(|i| u32::try_from(i).ok())
+        {
+            index.remove(i);
+        } else {
+            panic_with_error!(&env, LedgerError::NoReportToRetract);
+        }
+
+        env.storage().persistent().remove(&report_key);
+        let index_key = DataKey::Reporters(sac.clone(), tier);
+        if index.is_empty() {
+            env.storage().persistent().remove(&index_key);
+        } else {
+            write_persistent(&env, &index_key, &index);
+        }
+        bump_instance(&env);
+        ReserveRetracted {
+            sac,
+            tier,
+            reporter,
+            as_of: report.as_of,
+        }
+        .publish(&env);
     }
 
     pub fn get_asset(env: Env, sac: Address) -> Option<AssetRecord> {
