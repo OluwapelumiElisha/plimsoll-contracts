@@ -1797,8 +1797,14 @@ fn assert_within_budget(
     call: impl FnOnce(),
 ) {
     let (json_cpu, json_memory) = json_ceiling(function);
-    assert_eq!(const_cpu, json_cpu, "{function} CPU ceiling constant out of sync");
-    assert_eq!(const_memory, json_memory, "{function} memory ceiling constant out of sync");
+    assert_eq!(
+        const_cpu, json_cpu,
+        "{function} CPU ceiling constant out of sync"
+    );
+    assert_eq!(
+        const_memory, json_memory,
+        "{function} memory ceiling constant out of sync"
+    );
 
     // `env.cost_estimate().budget()` models `simulateTransaction` instruction
     // and memory metering for the invocation.
